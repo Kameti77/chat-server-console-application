@@ -1,0 +1,14 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.VC.db
+*.opendb
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+
+# Optional
+*.log
