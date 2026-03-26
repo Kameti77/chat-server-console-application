@@ -129,7 +129,10 @@ bool ChatServer::initWinsock()
 
 bool ChatServer::initSocket()
 {
-    listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // Use AF_INET6 so SpaghettiRelay (which connects via IPv6) can connect.
+    // Setting IPV6_V6ONLY to 0 makes it a dual-stack socket — it accepts
+    // both IPv4 and IPv6 clients on the same socket.
+    listenSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listenSocket == INVALID_SOCKET)
     {
         std::cout << "socket() failed. Error: " << WSAGetLastError() << "\n";
@@ -137,6 +140,7 @@ bool ChatServer::initSocket()
     }
     std::cout << "Socket created successfully.\n";
 
+    // SO_REUSEADDR — avoids "port already in use" on restart
     int opt = 1;
     if (setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR,
         (char*)&opt, sizeof(opt)) == SOCKET_ERROR)
@@ -148,11 +152,25 @@ bool ChatServer::initSocket()
         return false;
     }
 
-    sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons((u_short)port);
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    // IPV6_V6ONLY = 0 — dual stack mode
+    // Allows IPv4 clients to connect via IPv4-mapped IPv6 addresses.
+    // Without this, only pure IPv6 clients can connect.
+    int ipv6only = 0;
+    if (setsockopt(listenSocket, IPPROTO_IPV6, IPV6_V6ONLY,
+        (char*)&ipv6only, sizeof(ipv6only)) == SOCKET_ERROR)
+    {
+        std::cout << "setsockopt(IPV6_V6ONLY) failed. Error: "
+            << WSAGetLastError() << "\n";
+        closesocket(listenSocket);
+        listenSocket = INVALID_SOCKET;
+        return false;
+    }
+
+    // Bind to in6addr_any — listens on all interfaces for both IPv4 and IPv6
+    sockaddr_in6 serverAddr{};
+    serverAddr.sin6_family = AF_INET6;
+    serverAddr.sin6_port = htons((u_short)port);
+    serverAddr.sin6_addr = in6addr_any;
 
     if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
     {
@@ -280,10 +298,9 @@ void ChatServer::run()
 
             std::cout << "New client connected. Socket: " << newClient << "\n";
 
-            std::string welcome =
-                "Welcome to the Chat Server! "
-                "Use '" + std::string(1, cmdChar) + "' to send commands. "
-                "Type " + std::string(1, cmdChar) + "help to see all commands.";
+            // Short welcome — keeps SpaghettiRelay's display buffer clean
+            std::string welcome = "Welcome! Type " +
+                std::string(1, cmdChar) + "help for commands.";
 
             sendMessage(newClient, welcome.c_str(), (int)welcome.length());
         }

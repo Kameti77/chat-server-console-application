@@ -1,10 +1,10 @@
 ﻿#include "MessageHandler.h"
-#include "ChatServer.h"       // full definition needed to call sendMessage()
+#include "ChatServer.h"
 #include "ClientHandler.h"
 #include "UserRegistry.h"
 #include "Logger.h"
 #include <iostream>
-#include <sstream>            // for std::istringstream (splitting words)
+#include <sstream>
 #include <string>
 #include <map>
 
@@ -17,111 +17,95 @@ MessageHandler::MessageHandler(UserRegistry& reg, Logger& log,
 {
 }
 
-// reply — sends a message back to one client
+// ─────────────────────────────────────────────────────────────
+// reply — sends one message back to a client
+//
+// MAX is 200 bytes — safely under the 255-byte frame limit.
+// SpaghettiRelay's readMessage receives the 1-byte length first,
+// then reads exactly that many bytes. If we send 255 as the
+// length byte, SpaghettiRelay reads 255 bytes which is fine —
+// but its internal buffer size is unknown so we stay at 200
+// to guarantee nothing overflows on their side.
+//
+// If the message is longer than 200 bytes it is split into
+// separate frames. Each frame arrives as a separate message
+// in the SpaghettiRelay GUI.
+//
+// The null terminator is NOT sent over the wire — SpaghettiRelay
+// adds it locally after recv(), just like we do in readMessage().
+// ─────────────────────────────────────────────────────────────
 void MessageHandler::reply(int sock, const std::string& message)
 {
     if (message.empty())
         return;
 
-    const int MAX = 200; // safe margin under 255-byte limit
+    const int MAX = 200;
 
-    if ((int)message.length() <= MAX)
+    int offset = 0;
+    while (offset < (int)message.length())
     {
+        int remaining = (int)message.length() - offset;
+        int chunkLen = (remaining < MAX) ? remaining : MAX;
+
         server.sendMessage((SOCKET)sock,
-            message.c_str(),
-            (int)message.length());
-    }
-    else
-    {
-        // Split into chunks and send each one separately
-        int offset = 0;
-        while (offset < (int)message.length())
-        {
-            std::string chunk = message.substr(offset, MAX);
-            server.sendMessage((SOCKET)sock,
-                chunk.c_str(),
-                (int)chunk.length());
-            offset += MAX;
-        }
+            message.c_str() + offset,
+            chunkLen);
+
+        offset += chunkLen;
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-// handle — the main entry point
+// handle — main entry point called by ChatServer::run()
 // ─────────────────────────────────────────────────────────────
 bool MessageHandler::handle(int senderSocket,
     const std::string& message,
     std::map<int, ClientHandler>& clients)
 {
-    // Empty message — nothing to do
     if (message.empty())
         return true;
 
-    // Check if the first character matches the command prefix.
     if (message[0] == cmdChar)
     {
-        // ── Extract command word and arguments ────────────────
         std::istringstream stream(message);
         std::string cmdWord;
-        stream >> cmdWord;  // read first word e.g. "/register"
+        stream >> cmdWord;
 
-        // Remove the command character from the front
-        // so cmdWord becomes "register", "help", "login" etc.
+        // Strip the command character to get the name e.g. "help"
         std::string cmdName = cmdWord.substr(1);
 
-
+        // Read remaining text as arguments
         std::string args;
-        if (stream.peek() == ' ')
-            stream.ignore();               // skip the space
-        std::getline(stream, args);        // rest is arguments
+        std::getline(stream >> std::ws, args);
 
+        // Lowercase for case-insensitive matching
         std::string cmdLower = cmdName;
         for (char& c : cmdLower)
-            c = (char)tolower((unsigned char)c);
+            c = std::tolower(static_cast<unsigned char>(c));
 
-        if (cmdLower == "help")
-        {
-            handleHelp(senderSocket, args, clients);
-        }
-        else if (cmdLower == "register")
-        {
-            handleRegister(senderSocket, args, clients);
-        }
-        else if (cmdLower == "login")
-        {
-            handleLogin(senderSocket, args, clients);
-        }
+        if (cmdLower == "help")     handleHelp(senderSocket, args, clients);
+        else if (cmdLower == "register") handleRegister(senderSocket, args, clients);
+        else if (cmdLower == "login")    handleLogin(senderSocket, args, clients);
         else if (cmdLower == "logout")
         {
             bool shouldDisconnect = false;
             handleLogout(senderSocket, args, clients, shouldDisconnect);
             if (shouldDisconnect)
-                return false; // tells run() to close this socket
+                return false;
         }
-        else if (cmdLower == "getlist")
-        {
-            handleGetList(senderSocket, args, clients);
-        }
-        else if (cmdLower == "getlog")
-        {
-            handleGetLog(senderSocket, args, clients);
-        }
-        else if (cmdLower == "send")
-        {
-            handleSend(senderSocket, args, clients);
-        }
+        else if (cmdLower == "getlist")  handleGetList(senderSocket, args, clients);
+        else if (cmdLower == "getlog")   handleGetLog(senderSocket, args, clients);
+        else if (cmdLower == "send")     handleSend(senderSocket, args, clients);
         else
         {
-            // Unknown command — tell the client
             reply(senderSocket,
                 "Unknown command. Type " +
                 std::string(1, cmdChar) +
-                "help to see all available commands.");
+                "help to see all commands.");
         }
     }
     else
     {
-        // ── Normal chat message ────────────────────────────────
         auto it = clients.find(senderSocket);
         if (it == clients.end())
             return true;
@@ -129,122 +113,104 @@ bool MessageHandler::handle(int senderSocket,
         if (!it->second.loggedIn)
         {
             reply(senderSocket,
-                "Must be logged in to send messages. "
-                "Use " + std::string(1, cmdChar) +
-                "login username password.");
+                "You must be logged in to send messages. "
+                "Use " + std::string(1, cmdChar) + "login.");
             return true;
         }
 
-        // Relay to all other logged-in clients
         relayMessage(senderSocket, message, clients);
     }
 
-    return true; // keep the connection alive
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleHelp — responds to /help
+// handleHelp
+//
+// Each command is sent as its own reply() call.
+// This avoids chunking a large string and ensures each line
+// arrives cleanly and displays correctly in SpaghettiRelay.
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleHelp(int sock,
     const std::string& args,
     std::map<int, ClientHandler>& clients)
 {
-    // Build the help text listing every available command.
-    // We use the actual cmdChar so if the admin chose '!'
-    // the help text shows '!help', '!register' etc.
-    std::string c(1, cmdChar);  
+    std::string c(1, cmdChar);
 
-    std::string helpText =
-        "Available commands:\n"
-        "  " + c + "help                          - Show this list\n"
-        "  " + c + "register <username> <password> - Create an account\n"
-        "  " + c + "login <username> <password>    - Log into your account\n"
-        "  " + c + "logout                         - Log out and disconnect\n"
-        "  " + c + "send <username> <message>      - Send a private message\n"
-        "  " + c + "getlist                        - Show online users\n"
-        "  " + c + "getlog                         - Show public chat history";
-
-    reply(sock, helpText);
+    reply(sock, "=== Available Commands ===");
+    reply(sock, c + "help - Show this list");
+    reply(sock, c + "register <user> <pass> - Create account");
+    reply(sock, c + "login <user> <pass> - Log in");
+    reply(sock, c + "logout - Log out and disconnect");
+    reply(sock, c + "send <user> <msg> - Private message");
+    reply(sock, c + "getlist - Show online users");
+    reply(sock, c + "getlog - Show public chat history");
+    reply(sock, "==========================");
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleRegister — responds to /register username password
+// handleRegister
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleRegister(int sock,
     const std::string& args,
     std::map<int, ClientHandler>& clients)
 {
-    // ── Parse the two arguments: username and password ────────
-    // args should be "john pass123"
-    // If there are not exactly two words, the format is wrong.
     std::istringstream stream(args);
     std::string username, password;
     stream >> username >> password;
 
     if (username.empty() || password.empty())
     {
-        reply(sock,
-            "Usage: " + std::string(1, cmdChar) +
+        reply(sock, "Usage: " + std::string(1, cmdChar) +
             "register <username> <password>");
         return;
     }
 
-    // ── Check: is the client already logged in? ───────────────
-    // A logged-in client cannot register a new account.
     auto it = clients.find(sock);
     if (it != clients.end() && it->second.loggedIn)
     {
-        reply(sock, "Cannot register while already logged in. "
-            "Use " + std::string(1, cmdChar) + "logout first.");
+        reply(sock, "Already logged in. Use " +
+            std::string(1, cmdChar) + "logout first.");
         return;
     }
 
-    // ── Check: is the server at capacity? ────────────────────
     if (registry.isFull())
     {
-        reply(sock, "Server is full. Registration is not available.");
+        reply(sock, "Server is full. Registration not available.");
         return;
     }
 
-    // ── Try to register ───────────────────────────────────────
-    // registerUser() returns false if the username already exists
     bool success = registry.registerUser(username, password);
 
     if (!success)
     {
-        reply(sock, "Username '" + username + "' is already taken. "
-            "Please choose a different username.");
+        reply(sock, "Username '" + username + "' is already taken.");
         return;
     }
 
-    // Success
-    reply(sock, "Registration successful! Welcome, " + username +
-        ". Use " + std::string(1, cmdChar) +
-        "login " + username + " <password> to log in.");
+    reply(sock, "Registered successfully! Use " +
+        std::string(1, cmdChar) + "login to log in.");
 
     std::cout << "New user registered: " << username << "\n";
-
-    // Log the registration event
     logger.logCommand(username, "register");
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleLogin — responds to /login username password
+// handleLogin
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleLogin(int sock,
     const std::string& args,
     std::map<int, ClientHandler>& clients)
 {
-    // ── Check: already logged in? ────────────────────────────
     auto it = clients.find(sock);
     if (it != clients.end() && it->second.loggedIn)
     {
-        reply(sock, "Already logged in as '" + it->second.username +
-            "'. Use " + std::string(1, cmdChar) + "logout first.");
+        reply(sock, "Already logged in as '" +
+            it->second.username + "'. Use " +
+            std::string(1, cmdChar) + "logout first.");
         return;
     }
 
-    // ── Parse arguments ───────────────────────────────────────
     std::istringstream stream(args);
     std::string username, password;
     stream >> username >> password;
@@ -256,23 +222,19 @@ void MessageHandler::handleLogin(int sock,
         return;
     }
 
-    // ── Check username exists ─────────────────────────────────
     if (!registry.userExists(username))
     {
         reply(sock, "User '" + username + "' not found. "
-            "Use " + std::string(1, cmdChar) +
-            "register to create an account.");
+            "Please register first.");
         return;
     }
 
-    // ── Check password ────────────────────────────────────────
     if (!registry.authenticate(username, password))
     {
         reply(sock, "Incorrect password. Please try again.");
         return;
     }
 
-    // ── Success — mark as logged in ───────────────────────────
     if (it != clients.end())
     {
         it->second.loggedIn = true;
@@ -280,13 +242,13 @@ void MessageHandler::handleLogin(int sock,
     }
 
     reply(sock, "Login successful! Welcome, " + username + ".");
-    std::cout << username << " logged in on socket " << sock << "\n";
 
+    std::cout << username << " logged in on socket " << sock << "\n";
     logger.logCommand(username, "login");
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleLogout — responds to /logout
+// handleLogout
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleLogout(int sock,
     const std::string& args,
@@ -295,31 +257,30 @@ void MessageHandler::handleLogout(int sock,
 {
     auto it = clients.find(sock);
 
-    // Block logout if not logged in — nothing to log out from
     if (it == clients.end() || !it->second.loggedIn)
     {
         reply(sock, "Not logged in. Use " +
-            std::string(1, cmdChar) + "login username password first.");
+            std::string(1, cmdChar) + "login first.");
         return;
     }
 
     std::string username = it->second.username;
 
     reply(sock, "Goodbye, " + username + "! You have been logged out.");
-    std::cout << username << " logged out from socket " << sock << "\n";
+
+    std::cout << username << " logged out.\n";
     logger.logCommand(username, "logout");
 
     shouldDisconnect = true;
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleGetList — responds to /getlist
+// handleGetList
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleGetList(int sock,
     const std::string& args,
     std::map<int, ClientHandler>& clients)
 {
-    // Check the requester is logged in
     auto requester = clients.find(sock);
     if (requester == clients.end() || !requester->second.loggedIn)
     {
@@ -328,22 +289,20 @@ void MessageHandler::handleGetList(int sock,
         return;
     }
 
-    // Build the list of logged-in usernames
     std::string list = "Online users: ";
-    int count = 0;
+    bool first = true;
 
     for (auto& pair : clients)
     {
         if (pair.second.loggedIn)
         {
-            if (count > 0)
-                list += ", ";
+            if (!first) list += ", ";
             list += pair.second.username;
-            count++;
+            first = false;
         }
     }
 
-    if (count == 0)
+    if (first)
         list = "No users currently online.";
 
     reply(sock, list);
@@ -351,13 +310,12 @@ void MessageHandler::handleGetList(int sock,
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleGetLog — responds to /getlog
+// handleGetLog
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleGetLog(int sock,
     const std::string& args,
     std::map<int, ClientHandler>& clients)
 {
-    // Check the requester is logged in
     auto requester = clients.find(sock);
     if (requester == clients.end() || !requester->second.loggedIn)
     {
@@ -368,43 +326,37 @@ void MessageHandler::handleGetLog(int sock,
 
     std::string logContents = logger.readMessageLog();
 
-    const int CHUNK_SIZE = 200;
+    reply(sock, "--- Chat Log Start ---");
 
-    if ((int)logContents.size() <= CHUNK_SIZE)
+    if (logContents.empty() ||
+        logContents == "No message log found." ||
+        logContents == "Message log is empty.")
     {
-        reply(sock, logContents);
+        reply(sock, "No public messages logged yet.");
     }
     else
     {
-        // Send in chunks so we never exceed the 255-byte frame limit
-        int offset = 0;
-        while (offset < (int)logContents.size())
-        {
-            std::string chunk = logContents.substr(offset, CHUNK_SIZE);
-            reply(sock, chunk);
-            offset += CHUNK_SIZE;
-        }
+        // Send in 200-byte chunks via reply()
+        // reply() already handles chunking so just pass the full string
+        reply(sock, logContents);
     }
+
+    reply(sock, "--- Chat Log End ---");
 
     logger.logCommand(requester->second.username, "getlog");
 }
 
 // ─────────────────────────────────────────────────────────────
-// handleSend — responds to /send username message
-//
-// Sends a private message to one specific logged-in client.
-// Nobody else receives it. Not saved to the public log.
+// handleSend — private direct message
 // ─────────────────────────────────────────────────────────────
 void MessageHandler::handleSend(int sock,
     const std::string& args,
     std::map<int, ClientHandler>& clients)
 {
-    // Must be logged in to send a direct message
     auto senderIt = clients.find(sock);
     if (senderIt == clients.end() || !senderIt->second.loggedIn)
     {
-        reply(sock, "Must be logged in to send messages. Use " +
-            std::string(1, cmdChar) + "login username password.");
+        reply(sock, "Must be logged in to send messages.");
         return;
     }
 
@@ -412,34 +364,22 @@ void MessageHandler::handleSend(int sock,
     std::string targetName;
     stream >> targetName;
 
-    if (targetName.empty())
+    std::string msgText;
+    std::getline(stream >> std::ws, msgText);
+
+    if (targetName.empty() || msgText.empty())
     {
         reply(sock, "Usage: " + std::string(1, cmdChar) +
             "send <username> <message>");
         return;
     }
 
-    // Read the rest as the message text
-    std::string msgText;
-    if (stream.peek() == ' ') stream.ignore();
-    std::getline(stream, msgText);
-
-    if (msgText.empty())
-    {
-        reply(sock, "Usage: " + std::string(1, cmdChar) +
-            "send <username> <message>\n"
-            "Message cannot be empty.");
-        return;
-    }
-
-    // Cannot send to yourself
     if (targetName == senderIt->second.username)
     {
         reply(sock, "Cannot send a message to yourself.");
         return;
     }
 
-    // Find the target client in the clients map
     int targetSock = -1;
     for (auto& pair : clients)
     {
@@ -456,58 +396,40 @@ void MessageHandler::handleSend(int sock,
         return;
     }
 
-    // Format and deliver the private message
     std::string senderName = senderIt->second.username;
-    std::string formatted = "[DM from " + senderName + "]: " + msgText;
 
-    server.sendMessage((SOCKET)targetSock,
-        formatted.c_str(),
-        (int)formatted.length());
-
-    // Confirm to the sender that it was delivered
+    reply(targetSock, "[DM from " + senderName + "]: " + msgText);
     reply(sock, "[DM to " + targetName + "]: " + msgText);
 
     std::cout << "DM: " << senderName << " -> " << targetName
         << ": " << msgText << "\n";
 
-    logger.logCommand(senderName, "send " + targetName);
+    logger.logCommand(senderName, "send -> " + targetName);
 }
 
-
+// ─────────────────────────────────────────────────────────────
+// relayMessage — public message to all logged-in clients
+// ─────────────────────────────────────────────────────────────
 void MessageHandler::relayMessage(int senderSocket,
     const std::string& message,
     std::map<int, ClientHandler>& clients)
 {
-    // Get the sender's username from their ClientHandler
     auto senderIt = clients.find(senderSocket);
     if (senderIt == clients.end() || !senderIt->second.loggedIn)
         return;
 
     std::string senderName = senderIt->second.username;
-
-    // Format the message with the sender's name at the front
-    // This is what all other clients will see
     std::string formatted = "[" + senderName + "]: " + message;
 
-    // Loop through every connected client
     for (auto& pair : clients)
     {
-        // Skip the sender — they don't receive their own message
-        if (pair.first == senderSocket)
-            continue;
+        if (pair.first == senderSocket)  continue;
+        if (!pair.second.loggedIn)       continue;
 
-        // Only send to clients that are logged in
-        if (!pair.second.loggedIn)
-            continue;
-
-        // Send the formatted message to this client
-        server.sendMessage((SOCKET)pair.first,
-            formatted.c_str(),
-            (int)formatted.length());
+        reply(pair.first, formatted);
     }
 
-    // Save to messages.log
     logger.logMessage(senderName, message);
 
-    std::cout << "Relayed from " << senderName << ": " << message << "\n";
+    std::cout << "Relay [" << senderName << "]: " << message << "\n";
 }
