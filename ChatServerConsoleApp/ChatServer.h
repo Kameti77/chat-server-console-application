@@ -10,22 +10,23 @@
 #include "MessageHandler.h"
 #include "UserRegistry.h"
 #include "Logger.h"
+#include "UDPBroadcaster.h"
 
-// ChatServer is the heart of the program.
 class ChatServer
 {
 private:
     // --- sockets ---
-    SOCKET      listenSocket;   
-    fd_set      masterSet;      
+    SOCKET      listenSocket;
+    fd_set      masterSet;
     fd_set      readySet;
 
     // --- components ---
-    UserRegistry  registry;
-    Logger        logger;
+    UserRegistry    registry;
+    Logger          logger;
     MessageHandler* handler;
+    UDPBroadcaster* broadcaster;  // Phase 3 — UDP broadcast thread
 
-    // --- settings entered by admin at startup ---
+    // --- settings ---
     int         port;
     int         capacity;
     char        cmdChar;
@@ -38,15 +39,13 @@ public:
     ChatServer();
     ~ChatServer();
 
-    void promptAdminSettings();   // Step 1: ask port, capacity, cmdChar
-    void displayServerInfo();     // Step 2: show IP and port on console
-    bool initWinsock();           // Step 3: start up Winsock
-    bool initSocket();            // Step 4: create socket, bind, listen
-    void run();                   // Step 5: the main select() loop
-    void stop();                  // clean shutdown
+    void promptAdminSettings();
+    void displayServerInfo();
+    bool initWinsock();
+    bool initSocket();
+    void run();
+    void stop();
 
-    // ── Framing helpers (used by run() for every client) ──────
     int sendMessage(SOCKET sock, const char* data, int length);
-
     int readMessage(SOCKET sock, char* buffer, int size);
 };

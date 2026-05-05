@@ -12,6 +12,7 @@ ChatServer::ChatServer()
     capacity = 0;
     cmdChar = '/';
     handler = nullptr;
+    broadcaster = nullptr;   // Phase 3
     FD_ZERO(&masterSet);
     FD_ZERO(&readySet);
 }
@@ -20,6 +21,7 @@ ChatServer::~ChatServer()
 {
     stop();
     delete handler;
+    delete broadcaster;
 }
 
 void ChatServer::promptAdminSettings()
@@ -263,6 +265,13 @@ void ChatServer::run()
 {
     std::cout << "Server is ready. Waiting for clients...\n\n";
 
+    // Start the UDP broadcaster on its own background thread.
+    // serverIP is populated by displayServerInfo() which runs
+    // before run() so it is safe to use here.
+    // UDP port 9999 is what clients listen on to find the server.
+    broadcaster = new UDPBroadcaster(serverIP, port, 9999);
+    broadcaster->start();
+
     int maxFd = (int)listenSocket;
 
     while (true)
@@ -411,6 +420,13 @@ void ChatServer::run()
 // ─────────────────────────────────────────────────────────────
 void ChatServer::stop()
 {
+    // Stop the UDP broadcaster first
+    if (broadcaster != nullptr)
+    {
+        broadcaster->stop();
+    }
+
+    // Close all connected client sockets gracefully
     for (auto& pair : clients)
     {
         SOCKET sock = (SOCKET)pair.first;
