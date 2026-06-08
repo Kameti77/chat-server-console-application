@@ -11,4 +11,6 @@ x64/
 x86/
 
 # Optional
-*.log
+*.log*.mp4
+*.png
+*.pcapng
